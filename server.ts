@@ -3,6 +3,12 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import ffmpegPath from '@ffmpeg-installer/ffmpeg';
+import ffmpeg from 'fluent-ffmpeg';
+import fs from 'fs';
+import os from 'os';
+
+ffmpeg.setFfmpegPath(ffmpegPath.path);
 
 // Load local env files (.env.local takes precedence over .env).
 // In AI Studio these vars are injected at runtime, so this is a no-op there.
@@ -116,11 +122,20 @@ async function startServer() {
 
   app.use(express.json({ limit: '50mb' }));
 
-  // Endpoint to generate prompt
+    // Endpoint to generate prompt
   app.post('/api/generate-prompt', async (req, res) => {
     try {
-      const { productDesc, atmosphereDesc, productImages = [], atmosphereImages = [], duration = 10 }: GenerateBody & { duration?: number } = req.body;
+      const { productDesc, atmosphereDesc, productImages = [], atmosphereImages = [], duration = 10, transitionStyle = 'Fade', format = '9:16', backgroundMusic = 'Minimalist Synth' }: GenerateBody & { duration?: number, transitionStyle?: string, format?: string, backgroundMusic?: string } = req.body;
       const ai = getAiClient();
+      
+      const audioConstraints = backgroundMusic === 'None' 
+        ? '- **No music of any kind.** No score, soundtrack, background music, beat, or musical sting — ever.\n- **Audio is near-silent:** only very subtle, realistic diegetic sound effects (a faint surface tap, soft glass chime, gentle fabric or air, a single liquid drop). Often barely there.'
+        : `- **Audio/Music:** Explicitly instruct the model to use a **${backgroundMusic}** soundtrack. Subtle, realistic diegetic sound effects can also be included.`;
+        
+      const audioOutputContract = backgroundMusic === 'None'
+        ? 'Audio: near-silent, only very subtle realistic diegetic sound effects; no music of any kind, no score, no soundtrack, no musical sting'
+        : `Audio: A ${backgroundMusic} soundtrack, accompanied by subtle realistic diegetic sound effects`;
+
       const promptWriterSystemInstruction = `## Role
 You are an elite product-film director, editor and Gemini Omni prompt engineer in one box. You receive a handful of plain inputs from an everyday seller and return **one flawless, timestamped Omni directive prompt** that yields a premium, short-form product showcase reel built from several shots. You direct like a luxury commercial and cut like a master editor. Your taste *is* the product: restrained, expensive, clarifying. Never slop, never gimmick, never overclaim.
 
@@ -139,6 +154,8 @@ You are an elite product-film director, editor and Gemini Omni prompt engineer i
 - **~${duration} seconds total. 2–7 shots.** *You* decide the count for this product — never pad to seven.
 - **Each shot = one timestamp.** Beats typically 1–2s; vary deliberately.
 - Cut with an editor's eye: hook on frame one, vary scale and angle every cut, end on a held hero the product reads on.
+- **Transitions:** Explicitly use **${transitionStyle}** transitions between the cuts (e.g. "crossfades into", "zooms rapidly into", "wipes to", "glitches into" or whatever fits a ${transitionStyle} style best).
+- **Aspect Ratio:** Explicitly instruct the model to render the video in a **${format}** aspect ratio.
 
 ## Omni craft you apply
 Levers per shot: **subject · camera framing + motion · style · lighting · location.** Detail buys control; specify deliberately, never bloat.
@@ -148,10 +165,9 @@ Levers per shot: **subject · camera framing + motion · style · lighting · lo
 - **World knowledge.** Don't over-explain. State intent and let Omni reason the rest.
 
 ## Hard suppressions (always enforce in the output)
-- **No music of any kind.** No score, soundtrack, background music, beat, or musical sting — ever.
+${audioConstraints}
 - **No voice.** No voiceover, narration, dialogue or vocals.
 - **No overlaid graphics.** No on-screen text, titles, captions, subtitles, lower thirds, typography, added logos, badges, watermarks or UI. The only text permitted is what physically exists on the product itself.
-- **Audio is near-silent:** only very subtle, realistic diegetic sound effects (a faint surface tap, soft glass chime, gentle fabric or air, a single liquid drop). Often barely there.
 
 ## Editing patterns (the repertoire)
 - **Sequencing:** open with a hook (hero or striking detail) → vary shot scale and angle so each cut feels intentional → match-cut on motion or shape where possible → accent a beat or two → **land on a clean, held hero frame**.
@@ -163,14 +179,14 @@ Levers per shot: **subject · camera framing + motion · style · lighting · lo
 2. **Translate the brief** into a crafted environment, palette and light. Elevate; never literalise crudely.
    - *"white studio"* → seamless cyclorama, soft key, gentle floor gradient, one clean shadow.
    - *"clinical / skincare lab"* → cool neutral palette, glass and brushed chrome, caustic light, one tasteful water / serum motion.
-3. **Design the edit** — choose shot count and order; assign each a move that reveals a *real* feature; vary scale.
+3. **Design the edit** — choose shot count and order; assign each a move that reveals a *real* feature; vary scale. Use ${transitionStyle} transitions.
 4. **Time it** across ~${duration}s with editorial rhythm and a held final beat.
 5. **Write the directive prompt** per the contract below.
 
 ## Output contract
 Output **only** the directive prompt — nothing else. No "shot logic" line, no headings, no fences, no explanation before or after. It must begin with the words **"Create a professional product showcase reel"** and read as one clean, paste-ready directive in this shape:
 
-Create a professional product showcase reel of  <product> locked to the reference images so its identity, proportions, label and material stay accurate in every shot. Hard cuts between shots; the product is the hero throughout. Environment: . Grade and mood: premium, calm, confident, with soft motivated lighting that reveals the material truthfully.
+Create a professional product showcase reel of  <product> locked to the reference images so its identity, proportions, label and material stay accurate in every shot. Hard cuts or ${transitionStyle} transitions between shots; the product is the hero throughout. Aspect ratio: ${format}. Environment: . Grade and mood: premium, calm, confident, with soft motivated lighting that reveals the material truthfully.
 
 0.0–0.0s — .
 0.0–0.0s — .
@@ -178,7 +194,7 @@ Create a professional product showcase reel of  <product> locked to the referenc
 0.0–${duration}.0s — .
 
 
-Materials and physics: <how light and matter behave securely>. Audio: near-silent, only very subtle realistic diegetic sound effects; no music of any kind, no score, no soundtrack, no musical sting, no voiceover, no vocals. No on-screen text, titles, captions, lower thirds, typography, added logos, graphics, watermarks or UI of any kind. Avoid: distorted or rebranded product, invented features, extra props, harsh shadows, over-cutting, frantic pace, cheap gloss.
+Materials and physics: <how light and matter behave securely>. ${audioOutputContract}, no voiceover, no vocals. No on-screen text, titles, captions, lower thirds, typography, added logos, graphics, watermarks or UI of any kind. Avoid: distorted or rebranded product, invented features, extra props, harsh shadows, over-cutting, frantic pace, cheap gloss.
 
 ## Guardrails
 - Missing input → make the **smallest premium assumption** and fold it silently into the directive.
@@ -399,6 +415,92 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
   // Cache fetched videos in-memory so range requests (seeking) don't re-download
   // the whole file from Google on every scrub. These are short clips.
   const videoCache = new Map<string, Buffer>();
+
+  // Post-process the generated video to overlay text or image
+  app.post('/api/post-process', async (req, res) => {
+    try {
+      const { fileId, watermark } = req.body;
+      if (!watermark || watermark.type === 'none') {
+        return res.json({ fileId });
+      }
+
+      let buffer = videoCache.get(fileId);
+      if (!buffer) {
+        const apiKey = process.env.GEMINI_API_KEY;
+        const url = `https://generativelanguage.googleapis.com/v1beta/files/${fileId}:download?alt=media&key=${apiKey}`;
+        const upstream = await fetch(url);
+        if (!upstream.ok) throw new Error(`Failed to fetch video: ${upstream.statusText}`);
+        buffer = Buffer.from(await upstream.arrayBuffer());
+        videoCache.set(fileId, buffer);
+      }
+
+      const tempDir = os.tmpdir();
+      const inputPath = path.join(tempDir, `${fileId}-input.mp4`);
+      const outputPath = path.join(tempDir, `${fileId}-output.mp4`);
+      fs.writeFileSync(inputPath, buffer);
+
+      let command = ffmpeg(inputPath);
+
+      if (watermark.type === 'text' && watermark.text) {
+        command = command.videoFilters({
+          filter: 'drawtext',
+          options: {
+            text: watermark.text,
+            fontsize: 48,
+            fontcolor: 'white',
+            x: '(w-text_w)/2',
+            y: '(h-text_h)/2',
+            shadowcolor: 'black',
+            shadowx: 2,
+            shadowy: 2,
+            alpha: 0.7
+          }
+        });
+      } else if (watermark.type === 'image' && watermark.image) {
+        const imgPath = path.join(tempDir, `${fileId}-watermark.png`);
+        const base64Data = watermark.image.replace(/^data:image\/\w+;base64,/, "");
+        fs.writeFileSync(imgPath, base64Data, 'base64');
+        command = command
+          .input(imgPath)
+          .complexFilter([
+            '[1:v]scale=iw*0.2:-1[wm]', // scale watermark
+            '[0:v][wm]overlay=W-w-20:H-h-20' // bottom right
+          ]);
+      } else {
+        fs.unlinkSync(inputPath);
+        return res.json({ fileId }); // invalid watermark, skip processing
+      }
+
+      await new Promise((resolve, reject) => {
+        command.output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      });
+
+      const outputBuffer = fs.readFileSync(outputPath);
+      const newFileId = `${fileId}-wm-${Date.now()}`;
+      
+      fs.unlinkSync(inputPath);
+      fs.unlinkSync(outputPath);
+      if (watermark.type === 'image') {
+        const imgPath = path.join(tempDir, `${fileId}-watermark.png`);
+        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+      }
+
+      if (videoCache.size >= 12) {
+        const oldest = videoCache.keys().next().value;
+        if (oldest) videoCache.delete(oldest);
+      }
+      videoCache.set(newFileId, outputBuffer);
+
+      res.json({ fileId: newFileId });
+
+    } catch(e: any) {
+      console.error('Post processing error:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
 
   // Endpoint to proxy the actual video — supports HTTP range requests so the
   // player timeline can seek (browsers require 206 Partial Content for that).

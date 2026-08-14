@@ -1,11 +1,12 @@
 import React, { useState, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Loader2, ArrowRight, ChevronRight, Download } from 'lucide-react';
+import { Loader2, ArrowRight, ChevronRight, Download, Share2, Archive } from 'lucide-react';
 import { PRODUCTS, ATMOSPHERES, MediaSelection } from './data.js';
 import { ImageUploader } from './components/ImageUploader.js';
 import { VideoOutput } from './components/VideoOutput.js';
 import { ScrollRow } from './components/ScrollRow.js';
 import { toInlineImages, InlineImage } from './images.js';
+import JSZip from 'jszip';
 
 type LogType = 'info' | 'success' | 'warn' | 'error';
 type AppState = 'IDLE' | 'GENERATING_ATMOSPHERE' | 'GENERATING_PROMPT' | 'GENERATING_VIDEO' | 'VIDEO_READY';
@@ -21,8 +22,20 @@ export default function App() {
   const [product, setProduct] = useState<MediaSelection | null>(null);
   const [atmosphere, setAtmosphere] = useState<MediaSelection | null>(null);
   const [duration, setDuration] = useState<5 | 10 | 15>(10);
+  const [transitionStyle, setTransitionStyle] = useState<string>('Fade');
+  const [format, setFormat] = useState<string>('9:16');
+  const [backgroundMusic, setBackgroundMusic] = useState<string>('Minimalist Synth');
+  
+  const [watermarkType, setWatermarkType] = useState<'none' | 'text' | 'image'>('none');
+  const [watermarkText, setWatermarkText] = useState<string>('');
+  const [watermarkImage, setWatermarkImage] = useState<string | null>(null);
+
   const [appState, setAppState] = useState<AppState>('IDLE');
   const [submittedImages, setSubmittedImages] = useState<string[]>([]);
+
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchSelected, setBatchSelected] = useState<string[]>([]);
+  const [batchDownloading, setBatchDownloading] = useState(false);
 
   // "Generate your own atmosphere": a setting the user types instead of picking
   // or uploading an atmosphere image. On submit it's expanded by Flash Lite and
@@ -38,6 +51,7 @@ export default function App() {
   const [editText, setEditText] = useState('');
   const [promptOpen, setPromptOpen] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [sharing, setSharing] = useState(false);
 
   const [logs, setLogs] = useState<{ id: string; timestamp: string; message: string; type: LogType; image?: string }[]>([]);
 
@@ -103,8 +117,32 @@ export default function App() {
 
         if (data.state === 'ACTIVE') {
           clearInterval(interval);
-          addLog('Render complete. Stream ready.', 'success');
-          addVersion(interactionId, fileId, promptText);
+          addLog('Render complete from Omni.', 'success');
+          
+          if (watermarkType !== 'none') {
+            addLog('Applying post-processing watermark...', 'warn');
+            try {
+              const postRes = await fetch('/api/post-process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  fileId,
+                  watermark: { type: watermarkType, text: watermarkText, image: watermarkImage }
+                })
+              });
+              const postData = await postRes.json();
+              if (!postRes.ok) throw new Error(postData.error || 'Post-process failed');
+              
+              addLog('Post-processing complete.', 'success');
+              addVersion(interactionId, postData.fileId, promptText);
+            } catch (e: any) {
+              addLog(`Watermark failed, using original: ${e.message}`, 'error');
+              addVersion(interactionId, fileId, promptText);
+            }
+          } else {
+            addVersion(interactionId, fileId, promptText);
+          }
+
           setAppState('VIDEO_READY');
           if (isInitial) {
             // Reset the upload sidebar for the next run.
@@ -190,7 +228,7 @@ export default function App() {
       const promptRes = await fetch('/api/generate-prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ productDesc: product.description, atmosphereDesc, productImages, atmosphereImages, duration })
+        body: JSON.stringify({ productDesc: product.description, atmosphereDesc, productImages, atmosphereImages, duration, transitionStyle, format, backgroundMusic })
       });
       const promptData = await promptRes.json();
       if (!promptRes.ok) throw new Error(promptData.error || 'Failed to generate prompt');
@@ -278,6 +316,79 @@ export default function App() {
     }
   };
 
+  const shareVideo = async (version: VideoVersion) => {
+    if (!navigator.share) {
+      addLog('Native sharing is not supported on this browser.', 'warn');
+      return;
+    }
+    setSharing(true);
+    try {
+      const res = await fetch(version.videoUrl, { credentials: 'include' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const file = new File([blob], `omni-${version.label.toLowerCase()}.mp4`, { type: 'video/mp4' });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: 'Remix Omni Product Studio',
+          text: 'Check out this generated product reel!'
+        });
+      } else {
+        await navigator.share({
+          title: 'Remix Omni Product Studio',
+          text: 'Check out this generated product reel! (Video file sharing not supported on this device)',
+          url: window.location.href
+        });
+      }
+    } catch (e: any) {
+      if (e.name !== 'AbortError') {
+        addLog(`Share failed: ${e.message}`, 'error');
+      }
+    } finally {
+      setSharing(false);
+    }
+  };
+
+  const toggleBatchSelect = (label: string) => {
+    setBatchSelected(prev => 
+      prev.includes(label) ? prev.filter(l => l !== label) : [...prev, label]
+    );
+  };
+
+  const downloadBatch = async () => {
+    if (batchSelected.length === 0) return;
+    setBatchDownloading(true);
+    try {
+      const zip = new JSZip();
+      for (const label of batchSelected) {
+        const version = versions.find(v => v.label === label);
+        if (!version) continue;
+        const res = await fetch(version.videoUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        zip.file(`omni-${label.toLowerCase()}.mp4`, blob);
+      }
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'omni-batch.zip';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      setBatchMode(false);
+      setBatchSelected([]);
+      addLog('Batch download complete.', 'success');
+    } catch (e: any) {
+      addLog(`Batch download failed: ${e.message}`, 'error');
+    } finally {
+      setBatchDownloading(false);
+    }
+  };
+
   return (
     <div className="md:h-screen w-full flex flex-col md:overflow-hidden bg-zinc-950 font-sans">
 
@@ -333,6 +444,118 @@ export default function App() {
             </div>
           </div>
 
+          <div className="mb-10">
+            <h2 className="text-sm font-mono uppercase tracking-widest text-zinc-500 mb-4">Transition Style</h2>
+            <div className="flex gap-2">
+              {['Fade', 'Zoom', 'Slide', 'Glitch'].map(style => (
+                <button
+                  key={style}
+                  onClick={() => setTransitionStyle(style)}
+                  disabled={isGenerating}
+                  className={`flex-1 py-3 font-mono text-xs font-bold tracking-widest transition-colors ${
+                    transitionStyle === style
+                      ? 'bg-zinc-800 text-white'
+                      : 'bg-zinc-900/50 text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-300'
+                  } border ${transitionStyle === style ? 'border-zinc-700' : 'border-zinc-800'} disabled:opacity-50`}
+                >
+                  {style.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-10">
+            <h2 className="text-sm font-mono uppercase tracking-widest text-zinc-500 mb-4">Format</h2>
+            <div className="flex gap-2">
+              {['9:16', '1:1', '16:9'].map(f => (
+                <button
+                  key={f}
+                  onClick={() => setFormat(f)}
+                  disabled={isGenerating}
+                  className={`flex-1 py-3 font-mono text-sm font-bold tracking-widest transition-colors ${
+                    format === f
+                      ? 'bg-zinc-800 text-white'
+                      : 'bg-zinc-900/50 text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-300'
+                  } border ${format === f ? 'border-zinc-700' : 'border-zinc-800'} disabled:opacity-50`}
+                >
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-10">
+            <h2 className="text-sm font-mono uppercase tracking-widest text-zinc-500 mb-4">Background Music</h2>
+            <div className="flex flex-col gap-2">
+              {['Lo-fi Chill', 'Upbeat Pop', 'Cinematic Orchestral', 'Minimalist Synth', 'None'].map(music => (
+                <button
+                  key={music}
+                  onClick={() => setBackgroundMusic(music)}
+                  disabled={isGenerating}
+                  className={`px-4 py-3 text-left font-mono text-xs font-bold tracking-widest transition-colors ${
+                    backgroundMusic === music
+                      ? 'bg-zinc-800 text-white'
+                      : 'bg-zinc-900/50 text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-300'
+                  } border ${backgroundMusic === music ? 'border-zinc-700' : 'border-zinc-800'} disabled:opacity-50`}
+                >
+                  {music.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-10">
+            <h2 className="text-sm font-mono uppercase tracking-widest text-zinc-500 mb-4">Post-Process Watermark</h2>
+            <div className="flex gap-2 mb-4">
+              {['none', 'text', 'image'].map(type => (
+                <button
+                  key={type}
+                  onClick={() => setWatermarkType(type as 'none'|'text'|'image')}
+                  disabled={isGenerating}
+                  className={`flex-1 py-3 font-mono text-xs font-bold tracking-widest transition-colors ${
+                    watermarkType === type
+                      ? 'bg-zinc-800 text-white'
+                      : 'bg-zinc-900/50 text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-300'
+                  } border ${watermarkType === type ? 'border-zinc-700' : 'border-zinc-800'} disabled:opacity-50`}
+                >
+                  {type.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            
+            {watermarkType === 'text' && (
+              <input
+                type="text"
+                placeholder="Enter watermark text..."
+                value={watermarkText}
+                onChange={e => setWatermarkText(e.target.value)}
+                disabled={isGenerating}
+                className="w-full bg-zinc-900 border border-zinc-800 text-zinc-300 p-4 font-mono text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-white focus:border-transparent"
+              />
+            )}
+            
+            {watermarkType === 'image' && (
+              <div className="border border-zinc-800 border-dashed p-4 flex items-center justify-center bg-zinc-900/30">
+                <input 
+                  type="file" 
+                  accept="image/png" 
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      const reader = new FileReader();
+                      reader.onload = (e) => setWatermarkImage(e.target?.result as string);
+                      reader.readAsDataURL(file);
+                    }
+                  }} 
+                  className="text-xs text-zinc-500 file:mr-4 file:py-2 file:px-4 file:border-0 file:text-xs file:font-mono file:font-bold file:uppercase file:tracking-widest file:bg-zinc-800 file:text-white hover:file:bg-zinc-700 cursor-pointer"
+                />
+              </div>
+            )}
+            {watermarkType === 'image' && watermarkImage && (
+              <div className="mt-2 text-xs text-green-500 font-mono">Image loaded.</div>
+            )}
+          </div>
+
           {/* Persistent submit — writes the prompt and renders in one go.
               Wrapper carries the tooltip: a disabled button emits no hover events. */}
           <div title={submitHint} className={submitHint ? 'cursor-not-allowed' : undefined}>
@@ -363,24 +586,84 @@ export default function App() {
               video, the input carousel and the prompt all line up on one edge —
               the version label + EDIT occupy the gutter only on the video row. */}
 
-          {/* PREVIOUS VERSIONS — click to bring one back into the main view */}
-          {otherVersions.length > 0 && (
-            <div className="flex gap-3 md:gap-4 mb-8">
-              <div className="flex-none w-12" />
-              <ScrollRow className="flex-1 min-w-0" rowClassName="gap-4" deps={[otherVersions.length]}>
-                {otherVersions.map(v => (
-                  <button key={v.label} onClick={() => selectVersion(v.label)} className="group flex-none text-left">
-                    <div className="font-mono text-xs uppercase tracking-widest text-zinc-400 group-hover:text-white mb-1.5 transition-colors">{v.label}</div>
-                    <video
-                      src={v.videoUrl}
-                      muted
-                      playsInline
-                      preload="metadata"
-                      className="w-40 aspect-video object-cover bg-black opacity-70 group-hover:opacity-100 transition-opacity"
-                    />
+          {/* VERSIONS ROW */}
+          {(otherVersions.length > 0 || (batchMode && versions.length > 0)) && (
+            <div className="flex flex-col gap-4 mb-8">
+              <div className="flex gap-3 md:gap-4">
+                <div className="flex-none w-12" />
+                <div className="flex-1 min-w-0 flex items-center justify-between">
+                  <div className="font-mono text-xs uppercase tracking-widest text-zinc-500">
+                    {batchMode ? 'Select Versions to Export' : 'Previous Versions'}
+                  </div>
+                  {versions.length > 1 && (
+                    <button
+                      onClick={() => {
+                        setBatchMode(!batchMode);
+                        if (!batchMode) setBatchSelected([]);
+                      }}
+                      className={`font-mono text-xs uppercase tracking-widest transition-colors ${batchMode ? 'text-white' : 'text-zinc-500 hover:text-white'}`}
+                    >
+                      {batchMode ? 'Cancel' : 'Batch Export'}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="flex gap-3 md:gap-4">
+                <div className="flex-none w-12" />
+                <ScrollRow className="flex-1 min-w-0" rowClassName="gap-4" deps={[batchMode ? versions.length : otherVersions.length, batchMode, batchSelected.length]}>
+                  {(batchMode ? versions : otherVersions).map(v => (
+                    <button 
+                      key={v.label} 
+                      onClick={() => batchMode ? toggleBatchSelect(v.label) : selectVersion(v.label)} 
+                      onMouseEnter={(e) => {
+                        const vid = e.currentTarget.querySelector('video');
+                        if (vid) {
+                          vid.currentTime = 0;
+                          vid.play().catch(() => {});
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        const vid = e.currentTarget.querySelector('video');
+                        if (vid) {
+                          vid.pause();
+                          vid.currentTime = 0;
+                        }
+                      }}
+                      className={`group flex-none text-left relative ${batchMode && batchSelected.includes(v.label) ? 'ring-2 ring-white ring-offset-2 ring-offset-zinc-950' : ''}`}
+                    >
+                      <div className={`font-mono text-xs uppercase tracking-widest mb-1.5 transition-colors ${batchMode && batchSelected.includes(v.label) ? 'text-white' : 'text-zinc-400 group-hover:text-white'}`}>
+                        {v.label}
+                      </div>
+                      <video
+                        src={v.videoUrl}
+                        muted
+                        loop
+                        playsInline
+                        preload="metadata"
+                        className={`w-40 aspect-video object-cover bg-black transition-opacity ${batchMode && batchSelected.includes(v.label) ? 'opacity-100' : 'opacity-70 group-hover:opacity-100'}`}
+                      />
+                      {batchMode && (
+                        <div className={`absolute top-8 right-2 w-5 h-5 border-2 rounded-full flex items-center justify-center bg-zinc-950/50 backdrop-blur-sm ${batchSelected.includes(v.label) ? 'border-white' : 'border-zinc-400'}`}>
+                          {batchSelected.includes(v.label) && <div className="w-2.5 h-2.5 bg-white rounded-full" />}
+                        </div>
+                      )}
+                    </button>
+                  ))}
+                </ScrollRow>
+              </div>
+              {batchMode && batchSelected.length > 0 && (
+                <div className="flex gap-3 md:gap-4 mt-2">
+                  <div className="flex-none w-12" />
+                  <button
+                    onClick={downloadBatch}
+                    disabled={batchDownloading}
+                    className="flex items-center justify-center gap-2 px-6 py-2.5 font-mono text-xs font-bold uppercase tracking-widest text-zinc-950 bg-white hover:bg-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {batchDownloading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
+                    Download ZIP ({batchSelected.length})
                   </button>
-                ))}
-              </ScrollRow>
+                </div>
+              )}
             </div>
           )}
 
@@ -406,9 +689,18 @@ export default function App() {
                     disabled={downloading}
                     aria-label={`Download ${selected.label}`}
                     title="Download video"
-                    className="w-fit text-zinc-500 hover:text-white transition-colors disabled:opacity-50"
+                    className="w-fit text-zinc-500 hover:text-white transition-colors disabled:opacity-50 mt-1"
                   >
                     {downloading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                  </button>
+                  <button
+                    onClick={() => shareVideo(selected)}
+                    disabled={sharing}
+                    aria-label={`Share ${selected.label}`}
+                    title="Share video"
+                    className="w-fit text-zinc-500 hover:text-white transition-colors disabled:opacity-50"
+                  >
+                    {sharing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Share2 className="w-4 h-4" />}
                   </button>
                 </div>
               )}
