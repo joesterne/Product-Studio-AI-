@@ -56,7 +56,9 @@ export default function App() {
   const [logs, setLogs] = useState<{ id: string; timestamp: string; message: string; type: LogType; image?: string }[]>([]);
 
   const addLog = (message: string, type: LogType = 'info', image?: string) => {
-    setLogs(prev => [...prev, {
+    // Capped: the log grew unboundedly for the life of the session (every
+    // poll status appended), though only the last few are ever rendered.
+    setLogs(prev => [...prev.slice(-99), {
       id: Math.random().toString(36).substring(7),
       timestamp: new Date().toISOString().split('T')[1].substring(0, 12),
       message,
@@ -109,8 +111,20 @@ export default function App() {
   const pollVideoStatus = (fileId: string, interactionId: string, promptText: string, isInitial: boolean) => {
     addLog('Polling Omni for render status...', 'warn');
     let lastState = '';
+    // Hard deadline: polling used to run forever if the file state never
+    // became ACTIVE/FAILED (or the status endpoint kept 500ing), wedging the
+    // app in GENERATING with submit disabled.
+    let attempts = 0;
+    const MAX_ATTEMPTS = 120; // ~10 minutes at 5s intervals
 
     const interval = setInterval(async () => {
+      attempts++;
+      if (attempts > MAX_ATTEMPTS) {
+        clearInterval(interval);
+        addLog('Timed out waiting for the render to finish.', 'error');
+        setAppState(isInitial ? 'IDLE' : 'VIDEO_READY');
+        return;
+      }
       try {
         const res = await fetch(`/api/file-status/${fileId}`);
         const data = await res.json();
@@ -182,7 +196,9 @@ export default function App() {
 
     try {
       const productImages = await toInlineImages(product.images);
-      const productLabel = product.source === 'suggestion' ? product.id : 'product';
+      // MediaSelection.source is always 'upload' (nothing ever constructs a
+      // 'suggestion' selection), so this label is unconditionally 'product'.
+      const productLabel = 'product';
 
       // The atmosphere can come from a selection/upload or be generated on the fly.
       let atmosphereImages: InlineImage[];
@@ -247,6 +263,7 @@ export default function App() {
       });
       const videoData = await videoRes.json();
       if (!videoRes.ok) throw new Error(videoData.error || 'Failed to start video generation');
+      if (!videoData.fileId) throw new Error('Video generation returned no file id');
 
       addLog(`Interaction created successfully. ID: ${videoData.interactionId}`, 'success');
       pollVideoStatus(videoData.fileId, videoData.interactionId, generatedPrompt, true);
@@ -277,6 +294,7 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Edit failed');
+      if (!data.fileId) throw new Error('Edit returned no file id');
 
       addLog(`Edit interaction created: ${data.interactionId}`, 'success');
       pollVideoStatus(data.fileId, data.interactionId, instructions, false);

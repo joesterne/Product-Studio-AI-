@@ -1,4 +1,3 @@
-import React from 'react';
 import { Loader2, AlertTriangle } from 'lucide-react';
 
 type AppState = 'IDLE' | 'GENERATING_ATMOSPHERE' | 'GENERATING_PROMPT' | 'GENERATING_VIDEO' | 'VIDEO_READY';

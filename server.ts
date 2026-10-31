@@ -7,6 +7,7 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 
 ffmpeg.setFfmpegPath(ffmpegPath.path);
 
@@ -118,7 +119,7 @@ async function fileUriToBase64(uri: string): Promise<{ data: string; mimeType: s
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '50mb' }));
 
@@ -220,51 +221,6 @@ Materials and physics: <how light and matter behave securely>. ${audioOutputCont
     }
   });
 
-  // Quickly auto-describe an uploaded product/atmosphere in the same voice as the
-  // hard-coded examples, so every selection carries a description / style brief.
-  app.post('/api/describe', async (req, res) => {
-    try {
-      const { type, images = [] }: { type?: 'product' | 'atmosphere'; images?: InlineImage[] } = req.body;
-      if (images.length === 0) {
-        res.status(400).json({ error: 'No images provided' });
-        return;
-      }
-      const ai = getAiClient();
-
-      const productInstruction = `You write ultra-concise product descriptions for a premium product-film tool.
-Given product reference image(s), output ONE short description (1–2 sentences, plain language): what the product is, plus its key aesthetic and material details. Match the voice of these examples:
-- "An oversized cup holder-friendly mug that comes with the last straw you will ever need."
-- "Premium luxury running sneakers. Sculptural modular sole and an upper made out of suede nubuck leather and mesh sculptural panels."
-- "A bottle of perfume called 'Nerelle'. The ornate bottle features real stone minerals, sodalite, and malachite."
-Output ONLY the description text — no labels, no quotes, no preamble.`;
-
-      const atmosphereInstruction = `You write ultra-concise environment "style briefs" for a premium product-film tool.
-Given a reference image of an empty scene or backdrop, output ONE short style brief (1–3 sentences) describing the environment, materials, lighting and mood. Where the product would sit, refer to it as the literal token "the {product_id}" so it can be substituted later. Match the voice of these examples:
-- "Minimalist craft luxury. A pristine Carrara marble plinth rests against a soft sage backdrop. Crisp directional sunlight casts soft shadows, creating an earthy yet elevated aesthetic. The {product_id} is seen in perfect detail, conveying texture, calm, and sophisticated gradients."
-- "Mediterranean, modern luxury. Warm, porous travertine blocks create a structured geometric podium beneath a brilliant azure sky, presenting the {product_id} perfectly. Soft dappled leaf shadows contrast the sharp architectural lines, evoking a serene, sun-drenched coastal escape."
-- "Mediterranean minimalism utilizing a warm sun-drenched, polished plaster corner with a soft rose-tinted floor. Crisp palm frond silhouettes cast dramatic yet serene shadows evoking a premium organic golden-hour mood."
-Output ONLY the style brief text — no labels, no quotes, no preamble.`;
-
-      const isAtmosphere = type === 'atmosphere';
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-lite',
-        contents: [
-          { text: isAtmosphere ? 'Describe this scene/backdrop as a style brief:' : 'Describe this product:' },
-          ...images.map(img => ({ inlineData: { mimeType: img.mimeType, data: img.data } })),
-        ],
-        config: {
-          systemInstruction: isAtmosphere ? atmosphereInstruction : productInstruction,
-          maxOutputTokens: 512,
-          temperature: 0.7,
-        },
-      });
-
-      res.json({ description: (response.text || '').trim() });
-    } catch (e: any) {
-      console.error('Error describing image:', e);
-      res.status(500).json({ error: e.message });
-    }
-  });
 
   // Generate an atmosphere image from a tiny setting input. Two stages:
   //   1. gemini-3.1-flash-lite expands the input into a ~100-word image prompt.
@@ -417,13 +373,31 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
   const videoCache = new Map<string, Buffer>();
 
   // Post-process the generated video to overlay text or image
-  app.post('/api/post-process', async (req, res) => {
-    try {
-      const { fileId, watermark } = req.body;
-      if (!watermark || watermark.type === 'none') {
-        return res.json({ fileId });
-      }
+  // Escape user text for ffmpeg's drawtext filter: an unescaped :, ', \ or %
+  // (e.g. "Joe's 50% Off") breaks the filter graph and fails the whole run.
+  const escapeDrawtext = (value: string) =>
+    value.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/:/g, '\\:').replace(/%/g, '%%');
 
+  app.post('/api/post-process', async (req, res) => {
+    const { fileId, watermark } = req.body;
+    if (!watermark || watermark.type === 'none') {
+      return res.json({ fileId });
+    }
+
+    // fileId is client-supplied and was used raw in temp paths: a value with
+    // ../ escaped the temp dir, and concurrent runs for the same file
+    // overwrote each other's ffmpeg input/output mid-run.
+    if (typeof fileId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(fileId)) {
+      return res.status(400).json({ error: 'Invalid fileId' });
+    }
+
+    const tempDir = os.tmpdir();
+    const runId = crypto.randomUUID();
+    const inputPath = path.join(tempDir, `${fileId}-${runId}-input.mp4`);
+    const outputPath = path.join(tempDir, `${fileId}-${runId}-output.mp4`);
+    const imgPath = path.join(tempDir, `${fileId}-${runId}-watermark.png`);
+
+    try {
       let buffer = videoCache.get(fileId);
       if (!buffer) {
         const apiKey = process.env.GEMINI_API_KEY;
@@ -434,9 +408,6 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
         videoCache.set(fileId, buffer);
       }
 
-      const tempDir = os.tmpdir();
-      const inputPath = path.join(tempDir, `${fileId}-input.mp4`);
-      const outputPath = path.join(tempDir, `${fileId}-output.mp4`);
       fs.writeFileSync(inputPath, buffer);
 
       let command = ffmpeg(inputPath);
@@ -445,7 +416,7 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
         command = command.videoFilters({
           filter: 'drawtext',
           options: {
-            text: watermark.text,
+            text: escapeDrawtext(watermark.text),
             fontsize: 48,
             fontcolor: 'white',
             x: '(w-text_w)/2',
@@ -457,7 +428,6 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
           }
         });
       } else if (watermark.type === 'image' && watermark.image) {
-        const imgPath = path.join(tempDir, `${fileId}-watermark.png`);
         const base64Data = watermark.image.replace(/^data:image\/\w+;base64,/, "");
         fs.writeFileSync(imgPath, base64Data, 'base64');
         command = command
@@ -467,7 +437,6 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
             '[0:v][wm]overlay=W-w-20:H-h-20' // bottom right
           ]);
       } else {
-        fs.unlinkSync(inputPath);
         return res.json({ fileId }); // invalid watermark, skip processing
       }
 
@@ -480,13 +449,6 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
 
       const outputBuffer = fs.readFileSync(outputPath);
       const newFileId = `${fileId}-wm-${Date.now()}`;
-      
-      fs.unlinkSync(inputPath);
-      fs.unlinkSync(outputPath);
-      if (watermark.type === 'image') {
-        const imgPath = path.join(tempDir, `${fileId}-watermark.png`);
-        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
-      }
 
       if (videoCache.size >= 12) {
         const oldest = videoCache.keys().next().value;
@@ -499,6 +461,12 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
     } catch(e: any) {
       console.error('Post processing error:', e);
       res.status(500).json({ error: e.message });
+    } finally {
+      // Temp files used to leak on every failure path (only the success path
+      // unlinked); cleanup is unconditional now.
+      for (const p of [inputPath, outputPath, imgPath]) {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      }
     }
   });
 
@@ -532,8 +500,17 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
       const range = req.headers.range;
       if (range) {
         const match = /bytes=(\d*)-(\d*)/.exec(range);
-        let start = match && match[1] ? parseInt(match[1], 10) : 0;
-        let end = match && match[2] ? parseInt(match[2], 10) : total - 1;
+        let start: number;
+        let end: number;
+        if (match && match[1] === '' && match[2]) {
+          // Suffix range ("bytes=-500") means the LAST 500 bytes; the old math
+          // treated it as bytes 0-500 and served the head of the file.
+          start = Math.max(0, total - parseInt(match[2], 10));
+          end = total - 1;
+        } else {
+          start = match && match[1] ? parseInt(match[1], 10) : 0;
+          end = match && match[2] ? parseInt(match[2], 10) : total - 1;
+        }
         if (Number.isNaN(start)) start = 0;
         if (Number.isNaN(end) || end >= total) end = total - 1;
         if (start > end || start >= total) {
@@ -551,41 +528,6 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
     } catch (e: any) {
       console.error('Error streaming video:', e);
       res.status(500).send(e.message);
-    }
-  });
-
-  // User provided endpoints for gemini-3.1-flash-lite-image and gemini-3.1-flash-lite
-  app.post("/api/generate", async (req, res) => {
-    try {
-      const { prompt } = req.body;
-      const ai = getAiClient();
-      const textResponse = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite",
-        contents: prompt,
-        config: {
-          systemInstruction: "You are an infinite spatial-knowledge-engine generator. Respond to the user's query by generating AI content in a specific JSON format. The format must contain: 'text' (AI-generated explanatory text detailing the topic. Use markdown if necessary, but keep it brief and impactful. CRITICAL: You MUST wrap 2 to 4 key concepts or interesting terms in your text as markdown links using the exact format `[Search Term](Search Term)`, so users can click them to branch off and explore that topic further!), and 'prompts' (an array of exactly 3 string items containing suggested follow-up questions or sub-topics). Keep text concise and informative.",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              text: { type: Type.STRING },
-              prompts: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-            },
-            required: ["text", "prompts"],
-          },
-        },
-      });
-
-      let rawText = textResponse.text || "{}";
-      rawText = rawText.replace(/```(json)?/gi, '').trim();
-      const responseData = JSON.parse(rawText);
-      res.json(responseData);
-    } catch (error: any) {
-      console.error(error);
-      res.status(500).json({ error: "Failed to generate text content." });
     }
   });
 
@@ -653,7 +595,7 @@ Output ONLY the style brief text — no labels, no quotes, no preamble.`;
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
+    app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

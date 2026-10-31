@@ -25,6 +25,7 @@ export function ImageUploader({
   const [promptText, setPromptText] = useState('');
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const handleChipClick = (suggestion: SuggestionChip) => {
     setPromptText(suggestion.prompt);
@@ -86,6 +87,10 @@ export function ImageUploader({
         description: `Uploaded reference photo`,
       });
       setError(null);
+      // Extra files were silently discarded before; say so.
+      setNotice(picked.length > 1
+        ? `Used the first image only — ${picked.length - 1} more file${picked.length > 2 ? 's were' : ' was'} ignored (single-image flow).`
+        : null);
     } catch (err: any) {
       setError('Failed to process uploaded file.');
     } finally {
@@ -96,6 +101,7 @@ export function ImageUploader({
   const handleClear = () => {
     onSelect(null);
     setError(null);
+    setNotice(null);
   };
 
   const hasSelection = !!selection && selection.images.length > 0;
@@ -139,10 +145,15 @@ export function ImageUploader({
           {!disabled && (
             <button
               onClick={handleClear}
-              className="w-full py-2 font-mono text-xs uppercase tracking-wider text-zinc-400 hover:text-white transition-colors bg-zinc-900 border border-zinc-850 rounded-lg hover:bg-zinc-800"
+              className="w-full py-2 font-mono text-xs uppercase tracking-wider text-zinc-400 hover:text-white transition-colors bg-zinc-900 border border-zinc-800 rounded-lg hover:bg-zinc-800"
             >
               Reset and Generate New
             </button>
+          )}
+          {notice && (
+            <p className="text-xs font-mono text-amber-400 bg-amber-950/30 border border-amber-900/50 p-2.5 rounded-lg">
+              {notice}
+            </p>
           )}
         </div>
       ) : (
@@ -172,7 +183,7 @@ export function ImageUploader({
                   className={`px-2.5 py-1 text-[11px] font-mono rounded-full border transition-all ${
                     promptText === item.prompt
                       ? 'bg-white text-zinc-950 border-white font-medium'
-                      : 'bg-zinc-950 text-zinc-400 border-zinc-850 hover:border-zinc-700 hover:text-zinc-200'
+                      : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:border-zinc-700 hover:text-zinc-200'
                   }`}
                 >
                   {item.label}
@@ -206,6 +217,14 @@ export function ImageUploader({
 
           <div
             onClick={() => !generating && inputRef.current?.click()}
+            onKeyDown={(e) => {
+              // role="button" without a key handler was a dead control for
+              // keyboard users: Enter/Space did nothing.
+              if ((e.key === 'Enter' || e.key === ' ') && !generating) {
+                e.preventDefault();
+                inputRef.current?.click();
+              }
+            }}
             onDragOver={(e) => {
               e.preventDefault();
               if (!generating) setDragging(true);
